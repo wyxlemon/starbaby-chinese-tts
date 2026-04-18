@@ -166,11 +166,11 @@ export async function createApp() {
 }
 
 // Only start the server if this file is run directly
-if (import.meta.url === `file://${process.argv[1]}` || !process.env.VERCEL) {
+if (import.meta.url.endsWith(process.argv[1]?.replace(/\\/g, '/')) || !process.env.VERCEL) {
   createApp().then(app => {
-    const PORT = process.env.PORT || 3000;
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Server running on http://localhost:${PORT}`);
+    const port = Number(process.env.PORT) || 3000;
+    app.listen(port, "0.0.0.0", () => {
+      console.log(`Server running on http://localhost:${port}`);
     });
   });
 }
