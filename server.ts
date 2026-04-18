@@ -39,16 +39,17 @@ export async function createApp() {
         .replace(/（.*）/g, "")
         .replace(/pinyin:\s*[a-zA-Z1-5\s]*/gi, "")
         .replace(/instruction:\s*[^，。！？]*/gi, "")
-        .replace(/[^\u4e00-\u9fff，。！？；：「」『』]/g, " ")
+        // Allow all CJK Unified Ideographs plus punctuation (supports Traditional Chinese)
+        .replace(/[^\u4e00-\u9fa5\u3400-\u4dbf\u20000-\u2a6df\u2a700-\u2b73f\u2b740-\u2b81f\u2b820-\u2ceaf\uf900-\ufaff，。！？；：「」『』]/g, " ")
         .replace(/\s+/g, " ")
         .trim();
 
-      // Send raw Traditional Chinese text as requested
-      const ttsInput = cleanText || text;
-      console.log(`[Server TTS] Service: SiliconFlow | Text: "${ttsInput}"`);
-
+      // Convert text to Simplified Chinese for the TTS engines (they perform significantly better with Simplified input)
+      const ttsInput = t2s(cleanText || text);
+      
       // Primary: SiliconFlow (Unified for all segments)
       if (SILICONFLOW_API_KEY) {
+        console.log(`[Server TTS] Service: SiliconFlow | Text (Simplified): "${ttsInput}"`);
         try {
           const sfResponse = await fetch(SILICONFLOW_URL, {
             method: "POST",

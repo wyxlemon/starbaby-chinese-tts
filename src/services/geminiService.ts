@@ -22,6 +22,35 @@ const CATEGORY_MAP: Record<PracticeCategory, string> = {
 // Global in-flight promise to deduplicate concurrent requests
 let inFlightStoryPromise: Promise<AdventureStory> | null = null;
 
+/**
+ * Helper to retry AI calls with exponential backoff on 429 (Quota) errors.
+ */
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+  let lastError: any;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      lastError = error;
+      // Check for 429 Resource Exhausted
+      const isQuotaError = 
+        error?.message?.includes('429') || 
+        error?.status === 'RESOURCE_EXHAUSTED' ||
+        (error?.response?.status === 429);
+      
+      if (isQuotaError && i < maxRetries - 1) {
+        // Base delay 2s, 4s, 8s + jitter
+        const delay = Math.pow(2, i + 1) * 1000 + Math.random() * 1000;
+        console.warn(`[Gemini] Quota exceeded (429). Retrying in ${Math.round(delay)}ms... (Attempt ${i + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError;
+}
+
 const CLEAN_REGEX = /[*`#_]/g;
 
 function cleanText(text: string): string {
@@ -91,7 +120,7 @@ export async function generateAdventure(
     `;
 
     try {
-      const response = await ai.models.generateContent({
+      const response = await withRetry(() => ai.models.generateContent({
         model: "gemini-3-flash-preview",
         contents: prompt,
         config: {
@@ -131,7 +160,7 @@ export async function generateAdventure(
             required: ["title", "category", "prologue", "challenges", "ending", "achievement"]
           }
         }
-      });
+      }));
 
       const text = response.text;
       if (!text) throw new Error("AI returned empty content");
@@ -181,7 +210,7 @@ export async function evaluateSpeech(
   const prompt = `評測發音：「${targetWord}」。請以繁體中文給出兒童友好的建議，簡體中文給出語音合成用的建議。不包含任何標記符號。返回 JSON: isCorrect, score, feedback, simplifiedFeedback。`;
 
   try {
-    const response = await ai.models.generateContent({
+    const response = await withRetry(() => ai.models.generateContent({
       model: "gemini-3-flash-preview",
       contents: [
         { inlineData: { mimeType: "audio/webm", data: audioBase64 } },
@@ -200,7 +229,7 @@ export async function evaluateSpeech(
           required: ["isCorrect", "score", "feedback", "simplifiedFeedback"]
         }
       }
-    });
+    }));
 
     const result = JSON.parse(response.text);
     return {
