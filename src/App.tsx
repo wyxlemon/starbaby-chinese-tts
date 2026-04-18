@@ -11,7 +11,8 @@ import MistakesLibrary from './components/MistakesLibrary';
 import MedalsGallery from './components/MedalsGallery';
 import { Book, ScrollText, Medal as MedalIcon } from 'lucide-react';
 import { generateAdventure } from './services/geminiService';
-import { AdventureStory, PracticeCategory, Mistake, Medal } from './types';
+import { AdventureStory, PracticeCategory, Mistake, Medal, IntelligenceAnalysis } from './types';
+import { TEST_STORY } from './constants/testScript';
 
 type Screen = 'lobby' | 'game' | 'library' | 'medals';
 
@@ -19,17 +20,22 @@ export default function App() {
   const [screen, setScreen] = useState<Screen>('lobby');
   const [story, setStory] = useState<AdventureStory | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const isGeneratingRef = React.useRef(false);
   
   // Persistence State
   const [mistakes, setMistakes] = useState<Mistake[]>([]);
   const [medals, setMedals] = useState<Medal[]>([]);
+  const [analysis, setAnalysis] = useState<IntelligenceAnalysis | null>(null);
 
   // Load from LocalStorage
   useEffect(() => {
     const savedMistakes = localStorage.getItem('xingbao_mistakes');
     const savedMedals = localStorage.getItem('xingbao_medals');
+    const savedAnalysis = localStorage.getItem('xingbao_analysis');
+    
     if (savedMistakes) setMistakes(JSON.parse(savedMistakes));
     if (savedMedals) setMedals(JSON.parse(savedMedals));
+    if (savedAnalysis) setAnalysis(JSON.parse(savedAnalysis));
   }, []);
 
   // Save to LocalStorage
@@ -41,10 +47,23 @@ export default function App() {
     localStorage.setItem('xingbao_medals', JSON.stringify(medals));
   }, [medals]);
 
-  const startJourney = async (input: string, category: PracticeCategory, heroName: string) => {
+  useEffect(() => {
+    if (analysis) {
+      localStorage.setItem('xingbao_analysis', JSON.stringify(analysis));
+    }
+  }, [analysis]);
+
+  const startJourney = async (input: string, category: PracticeCategory, heroName: string, assessmentReport?: string | AdventureStory) => {
+    if (isGeneratingRef.current) return;
     setIsLoading(true);
+    isGeneratingRef.current = true;
     try {
-      const generated = await generateAdventure(input, category, heroName);
+      if (typeof assessmentReport === 'object' && assessmentReport !== null && 'challenges' in assessmentReport) {
+        setStory(assessmentReport as AdventureStory);
+        setScreen('game');
+        return;
+      }
+      const generated = await generateAdventure(input, category, heroName, assessmentReport as string);
       setStory(generated);
       setScreen('game');
     } catch (error) {
@@ -52,6 +71,7 @@ export default function App() {
       alert("生成探險地圖失敗，請重試。");
     } finally {
       setIsLoading(false);
+      isGeneratingRef.current = false;
     }
   };
 
@@ -88,12 +108,7 @@ export default function App() {
           <span className="font-extrabold text-2xl text-primary tracking-tight">星寶語音冒險</span>
         </div>
         <div className="hidden sm:flex items-center gap-6">
-          <div className="flex items-center gap-2 bg-app-bg px-4 py-1.5 rounded-full font-semibold text-sm">
-            <span>💎</span> 450
-          </div>
-          <div className="flex items-center gap-2 bg-app-bg px-4 py-1.5 rounded-full font-semibold text-sm text-primary">
-            <span>🔥</span> 第 {medals.length + 1} 天
-          </div>
+          {/* Stats removed as requested */}
         </div>
       </header>
 
@@ -112,7 +127,12 @@ export default function App() {
                   <h1 className="text-6xl font-black mb-4 tracking-tighter text-ink">語音探險：星寶傳說</h1>
                   <p className="text-gray-500 font-serif italic text-xl">跟隨小精靈星寶，在故事書中開啟發音奇旅</p>
                 </div>
-                <StoryAdventurer onStart={startJourney} isLoading={isLoading} />
+                <StoryAdventurer 
+                  onStart={startJourney} 
+                  onStartTest={() => startJourney('', 'RETROFLEX', '小勇士', TEST_STORY)}
+                  isLoading={isLoading} 
+                  analysis={analysis} 
+                />
               </motion.div>
             )}
 
@@ -136,8 +156,14 @@ export default function App() {
             {screen === 'library' && (
               <MistakesLibrary 
                 mistakes={mistakes} 
-                onClear={() => setMistakes([])} 
+                onClear={() => {
+                  setMistakes([]);
+                  setAnalysis(null);
+                  localStorage.removeItem('xingbao_analysis');
+                }} 
                 onBack={resetGame}
+                onAnalysisUpdate={setAnalysis}
+                initialAnalysis={analysis}
               />
             )}
 

@@ -8,7 +8,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { AdventureStory } from '../types';
 import { speechService } from '../services/speechService';
 import { evaluateSpeech, generateSpeech } from '../services/geminiService';
-import { Mic, MicOff, Trophy, Volume2, Star, MessageCircle, ChevronRight, Book, Play } from 'lucide-react';
+import { Mic, MicOff, Trophy, Volume2, Star, MessageCircle, ChevronRight, Book, Play, Gauge } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
 interface Props {
@@ -22,12 +22,13 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
   const [currentIdx, setCurrentIdx] = useState(0);
   const [isListening, setIsListening] = useState(false);
   const [isEvaluating, setIsEvaluating] = useState(false);
-  const [feedback, setFeedback] = useState<{ type: 'success' | 'error' | 'idle', message: string, score?: number }>({ type: 'idle', message: '' });
+  const [feedback, setFeedback] = useState<{ type: 'success' | 'error' | 'idle', message: string, simplifiedMessage?: string, score?: number }>({ type: 'idle', message: '' });
   const [isDone, setIsDone] = useState(false);
   const [showIntro, setShowIntro] = useState(true);
   const [isTTSLoading, setIsTTSLoading] = useState(false);
   const [isPlaying, setIsPlaying] = useState<string | null>(null);
   const [isHoveringWord, setIsHoveringWord] = useState(false);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
 
   // Audio Caching
   const ttsCache = React.useRef<Record<string, string>>({});
@@ -35,8 +36,57 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
   // Audio management to prevent overlaps
   const currentAudioSource = React.useRef<AudioBufferSourceNode | null>(null);
   const audioContextRef = React.useRef<AudioContext | null>(null);
+  const activeSpeakerRef = React.useRef<string | null>(null);
+  const isRequestingSpeechRef = React.useRef<boolean>(false);
+  const prefetchQueue = React.useRef<Set<string>>(new Set());
 
   const challenge = story.challenges[currentIdx];
+
+  // Prefetch Audio logic
+  useEffect(() => {
+    const prefetchNext = async () => {
+      // Prefetch current word if not already cached
+      const currentWordText = challenge.word;
+      const wordKey = `${currentWordText}_${playbackSpeed}`;
+      if (!ttsCache.current[wordKey] && !prefetchQueue.current.has(wordKey)) {
+        prefetchQueue.current.add(wordKey);
+        generateSpeech(currentWordText, playbackSpeed).then(audio => {
+          if (audio) ttsCache.current[wordKey] = audio;
+        });
+      }
+
+      // Prefetch next segment
+      const nextChallenge = story.challenges[currentIdx + 1];
+      if (nextChallenge) {
+        const nextText = nextChallenge.storySegment;
+        const nextKey = `${nextText}_${playbackSpeed}`;
+        
+        if (!ttsCache.current[nextKey] && !prefetchQueue.current.has(nextKey)) {
+          prefetchQueue.current.add(nextKey);
+          console.log(`[Prefetch] Queuing next segment...`);
+          generateSpeech(nextText, playbackSpeed).then(audio => {
+            if (audio) {
+              ttsCache.current[nextKey] = audio;
+              console.log(`[Prefetch] Next segment loaded.`);
+            }
+          });
+        }
+      }
+    };
+
+    prefetchNext();
+  }, [currentIdx, playbackSpeed, story.challenges]);
+
+  // Auto-play prologue when intro is shown
+  useEffect(() => {
+    if (showIntro && story.prologue) {
+      // Delay slightly for smooth transition
+      const timer = setTimeout(() => {
+        speak(story.prologue);
+      }, 500);
+      return () => clearTimeout(timer);
+    }
+  }, [showIntro, story.prologue]);
 
   useEffect(() => {
     // Cleanup audio on unmount
@@ -64,20 +114,21 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
   };
 
   const playReference = () => {
-    speak(challenge.word, challenge.simplifiedWord, 0.5, 1.6, 'word');
+    speak(challenge.word, 'word');
   };
 
   const speak = async (
     text: string, 
-    simplifiedText?: string,
-    rate: number = 0.8, 
-    pitch: number = 1.0, 
-    type: 'story' | 'word' = 'story'
+    type: 'story' | 'word' = 'story',
+    pinyin?: string
   ) => {
     if (!text) return;
     
-    // We use the simplified text strictly for the TTS engine for better Mandarin accuracy
-    const ttsText = simplifiedText || text;
+    // Use current playback speed state
+    const currentSpeed = playbackSpeed;
+
+    // Use the provided text (which is already Traditional Chinese)
+    const ttsText = text;
 
     // If the same text is already playing, stop it and return (toggle behavior)
     if (isPlaying === text) {
@@ -88,30 +139,48 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
 
     // Stop any existing audio before starting new one
     stopCurrentAudio();
+    
+    // reset active speaker on each new meaningful click
+    activeSpeakerRef.current = null;
+    
+    if (isTTSLoading && isPlaying === text) return;
+    if (isRequestingSpeechRef.current) {
+        console.log("[TTS] Request already in progress (sync-lock)");
+        return;
+    }
+    
+    // Deduplication within this component instance
+    const dedupeKey = ttsText + currentSpeed;
+    activeSpeakerRef.current = dedupeKey;
+
     setIsPlaying(text);
     setIsTTSLoading(true);
+    isRequestingSpeechRef.current = true;
     
     // Defensive check: Ensure ttsText is a string before calling substring
     const safeText = String(ttsText || "");
-    console.log(`[TTS] Requesting speech for: "${safeText.substring(0, 20)}..."`);
+    const cacheKey = `${safeText}_${currentSpeed}`;
+    
+    console.log(`[TTS] Active Segment: "${safeText.substring(0, 15)}..." Speed: ${currentSpeed}`);
 
     try {
-      // Check Cache First (using simplified text as key for robustness)
-      let base64Audio = ttsCache.current[safeText];
+      // Check Cache First
+      let base64Audio = ttsCache.current[cacheKey];
       
       if (!base64Audio) {
-        // We pass the simplified text to the service
-        base64Audio = await generateSpeech(safeText) || '';
+        // We pass the Traditional text and current speed to the service
+        base64Audio = await generateSpeech(safeText, currentSpeed) || '';
         if (base64Audio) {
-          ttsCache.current[safeText] = base64Audio;
+          ttsCache.current[cacheKey] = base64Audio;
         }
       } else {
         console.log("[TTS] Using cached audio for:", safeText.substring(0, 10));
       }
 
       if (base64Audio) {
+        console.log(`[TTS] ${safeText.substring(0, 10)}... Audio obtained successfully (${base64Audio.length} chars).`);
         if (!audioContextRef.current) {
-          audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+          audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
         }
         
         const audioContext = audioContextRef.current;
@@ -156,43 +225,61 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
           if (currentAudioSource.current === source) {
             currentAudioSource.current = null;
             setIsPlaying(null);
+            activeSpeakerRef.current = null;
           }
         };
+
+        // Fade in to avoid "clicks"
+        const gainNode = audioContext.createGain();
+        gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+        gainNode.gain.linearRampToValueAtTime(1, audioContext.currentTime + 0.05); // Faster fade
+        source.connect(gainNode);
+        gainNode.connect(audioContext.destination);
 
         source.start();
         setIsTTSLoading(false);
         return;
       } else {
-        console.warn("[TTS] Gemini returned no audio, falling back...");
+        console.warn(`[TTS] Provider returned no data for: "${safeText.substring(0, 15)}..."`);
       }
     } catch (error) {
-      console.warn("[TTS] Gemini TTS failed, falling back to browser TTS", error);
+      console.error("[TTS] Critical error in speak cycle:", error);
+    } finally {
+      setIsTTSLoading(false);
+      isRequestingSpeechRef.current = false;
     }
 
-    // Fallback: Browser Speech Synthesis
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.onstart = () => setIsTTSLoading(false);
-    utterance.onerror = () => setIsTTSLoading(false);
-    utterance.onend = () => setIsTTSLoading(false);
-    utterance.lang = 'zh-CN';
-    
-    const getChildVoice = () => {
-      const voices = window.speechSynthesis.getVoices();
-      return voices.find(v => 
-        (v.name.includes('Kid') || v.name.includes('Child') || v.name.includes('Junior')) && 
-        v.lang.startsWith('zh')
-      ) || voices.find(v => v.lang.startsWith('zh') && v.name.includes('Lili'))
-        || voices.find(v => v.lang.startsWith('zh'));
-    };
-    
-    const selectedVoice = getChildVoice();
-    if (selectedVoice) {
-      utterance.voice = selectedVoice;
-    }
+    // Only fallback if no audio was started and no current source is active
+    if (!currentAudioSource.current) {
+      console.log("[TTS] Using Browser Speech Synthesis Fallback");
+      const utterance = new SpeechSynthesisUtterance(text);
+      const clearStates = () => {
+        setIsTTSLoading(false);
+        activeSpeakerRef.current = null;
+      };
+      utterance.onstart = () => setIsTTSLoading(false);
+      utterance.onerror = clearStates;
+      utterance.onend = clearStates;
+      utterance.lang = 'zh-CN';
+      
+      const getChildVoice = () => {
+        const voices = window.speechSynthesis.getVoices();
+        return voices.find(v => 
+          (v.name.includes('Kid') || v.name.includes('Child') || v.name.includes('Junior')) && 
+          v.lang.startsWith('zh')
+        ) || voices.find(v => v.lang.startsWith('zh') && v.name.includes('Lili'))
+          || voices.find(v => v.lang.startsWith('zh'));
+      };
+      
+      const selectedVoice = getChildVoice();
+      if (selectedVoice) {
+        utterance.voice = selectedVoice;
+      }
 
-    utterance.rate = rate; // rate/pitch might not map perfectly to API, but for browser it's fine
-    utterance.pitch = pitch;
-    window.speechSynthesis.speak(utterance);
+      utterance.rate = currentSpeed; 
+      utterance.pitch = 1.0;
+      window.speechSynthesis.speak(utterance);
+    }
   };
 
   const handleSpeechAction = async () => {
@@ -221,6 +308,7 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
           setFeedback({ 
             type: 'success', 
             message: result.feedback, 
+            simplifiedMessage: result.simplifiedFeedback,
             score: result.score 
           });
           
@@ -232,10 +320,11 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
           });
 
           // Play success feedback audio
-          speak(result.feedback, '', 0.9, 1.4);
+          speak(result.feedback);
         } else {
           setFeedback({ 
             message: result.feedback,
+            simplifiedMessage: result.simplifiedFeedback,
             score: result.score,
             type: 'error'
           });
@@ -244,7 +333,7 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
             pinyin: challenge.pinyin,
             feedback: result.feedback
           });
-          speak(result.feedback, '', 0.9, 1.4);
+          speak(result.feedback);
         }
       } catch (error) {
         console.error(error);
@@ -269,34 +358,26 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
        <motion.div 
          initial={{ opacity: 0, y: 20 }}
          animate={{ opacity: 1, y: 0 }}
-         className="max-w-3xl mx-auto p-12 bg-white rounded-[48px] shadow-2xl border-8 border-[#FDFCF0] text-center space-y-10"
+         className="max-w-4xl mx-auto p-12 bg-white rounded-[48px] shadow-2xl border-8 border-[#FDFCF0] text-center space-y-10"
        >
          <div className="w-40 h-40 bg-primary/10 rounded-full flex items-center justify-center mx-auto animate-pulse">
            <div className="text-8xl">🧚‍♂️</div>
          </div>
+         
          <div className="space-y-6">
-           <h2 
-             className="text-4xl font-black text-ink cursor-pointer hover:text-primary transition-colors"
-             onClick={() => speak('歡迎來到星寶的世界！', '欢迎来到星宝的世界！', 0.8, 1.5)}
-           >
-             歡迎來到星寶的世界！ 🔊
-           </h2>
-           <div 
-             className="bg-app-bg p-8 rounded-3xl text-left border-l-8 border-secondary font-medium text-lg leading-relaxed text-gray-600 cursor-pointer hover:bg-secondary/5 transition-colors relative group"
-             onClick={() => speak(
-                '星寶的魔法來自於你美妙的聲音。這本書裡隱藏了一些古代咒語，只有當你準確地唸對它們，產生的魔法共鳴才能幫助我們解開路上的障礙。準備好用你的聲音拯救森林了嗎？', 
-                '星宝的魔法来自于你美妙的声音。这本书里隐藏了一些古代咒语，只有当你准确地念对它们，产生的魔法共鸣才能帮助我们解开路上的障碍。准备好用你的声音拯救森林了吗？',
-                0.8, 
-                1.4
-              )}
-           >
-             <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
-               <Volume2 className="w-4 h-4 text-secondary" />
-             </div>
-             「星寶的魔法來自於你美妙的聲音。這本書裡隱藏了一些古代咒語，只有當你**準確地唸對它們**，產生的魔法共鳴才能幫助我們解開路上的障礙。準備好用你的聲音拯救森林了嗎？」
-             <div className="mt-4 text-xs font-bold text-secondary text-center italic opacity-60">點擊文字讓星寶說給你聽 ✨</div>
-           </div>
+            <div 
+              className="bg-app-bg p-10 rounded-[40px] text-left border-l-8 border-primary font-medium text-xl leading-relaxed text-gray-700 cursor-pointer hover:bg-primary/5 transition-colors relative group shadow-inner"
+              onClick={() => speak(story.prologue)}
+            >
+              <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity">
+                <Volume2 className="w-5 h-5 text-primary" />
+              </div>
+              <p className="font-serif italic text-2xl mb-4 text-ink/40">探險故事序章...</p>
+              {story.prologue}
+              <div className="mt-8 text-xs font-bold text-primary text-center tracking-widest uppercase opacity-40">點擊文字讓星寶說給你聽 ✨</div>
+            </div>
          </div>
+
          <button 
            onClick={() => setShowIntro(false)}
            className="w-full bg-primary text-white py-6 rounded-2xl text-2xl font-black hover:bg-primary/90 transition-all shadow-xl shadow-primary/20 active:scale-95 flex items-center justify-center gap-3"
@@ -316,28 +397,61 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
         className="max-w-3xl mx-auto text-center p-16 bg-white rounded-[40px] shadow-[0_40px_100px_rgba(0,0,0,0.1)] mt-10 border-8 border-[#FDFCF0] relative overflow-hidden"
       >
         <div className="absolute -top-10 -right-10 text-9xl opacity-10">✨</div>
-        <div className="w-32 h-32 bg-accent rounded-full flex items-center justify-center mx-auto mb-10 shadow-lg animate-bounce">
-          <Trophy className="w-16 h-16 text-white" />
-        </div>
+        <div className="absolute -bottom-10 -left-10 text-9xl opacity-10">🌈</div>
+        
+        {/* Surprise Achievement Medal */}
+        <motion.div 
+          initial={{ y: 50, opacity: 0 }}
+          animate={{ y: 0, opacity: 1 }}
+          transition={{ delay: 0.3, type: 'spring', stiffness: 200 }}
+          className="relative mb-12"
+        >
+          <div className="w-48 h-48 bg-gradient-to-br from-yellow-300 via-orange-400 to-yellow-600 rounded-full flex items-center justify-center mx-auto shadow-[0_20px_50px_rgba(251,191,36,0.3)] border-8 border-white group">
+            <motion.div 
+              animate={{ rotate: [0, -10, 10, -10, 0], scale: [1, 1.1, 1] }} 
+              transition={{ repeat: Infinity, duration: 4 }}
+              className="text-9xl filter drop-shadow-xl"
+            >
+              {story.achievement?.icon || '🎖️'}
+            </motion.div>
+          </div>
+          
+          <motion.div 
+            initial={{ scale: 0 }}
+            animate={{ scale: 1 }}
+            transition={{ delay: 0.8, type: 'spring' }}
+            className="absolute -bottom-4 left-1/2 -translate-x-1/2 bg-ink text-white px-8 py-3 rounded-2xl font-black text-xl whitespace-nowrap shadow-2xl skew-x-[-5deg]"
+          >
+            {story.achievement?.title || '冒險家獎章'}
+          </motion.div>
+        </motion.div>
+
         <h2 className="text-5xl font-black mb-6 text-ink tracking-tight">冒險大成功！</h2>
-        <div className="bg-app-bg p-8 rounded-[32px] mb-10 text-left relative">
-           <div className="absolute -top-4 -left-4 bg-primary text-white p-2 rounded-xl">
+        
+        <div className="bg-app-bg p-8 rounded-[32px] mb-10 text-left relative border border-gray-100 italic">
+           <div className="absolute -top-4 -left-4 bg-primary text-white p-2 rounded-xl shadow-lg">
              <MessageCircle className="w-6 h-6" />
            </div>
            <p 
-             className="text-xl leading-relaxed text-gray-600 font-medium italic cursor-pointer hover:text-primary transition-colors"
-             onClick={() => speak(story.ending, story.simplifiedEnding, 0.8, 1.4)}
+             className="text-xl leading-relaxed text-gray-600 font-medium cursor-pointer hover:text-primary transition-colors"
+             onClick={() => speak(story.ending)}
            >
              "{story.ending}"
            </p>
            <p className="mt-4 font-bold text-primary">—— 小精靈星寶如是說</p>
         </div>
-        <button 
-          onClick={onExit}
-          className="bg-primary text-white w-full py-6 rounded-2xl text-2xl font-black hover:bg-primary/90 transition-all shadow-xl shadow-primary/20 active:scale-95"
-        >
-          返回圖書館
-        </button>
+
+        <div className="flex flex-col gap-4">
+          <button 
+            onClick={onExit}
+            className="bg-primary text-white w-full py-6 rounded-3xl text-2xl font-black hover:bg-primary/90 transition-all shadow-xl shadow-primary/20 active:scale-95 translate-y-0 hover:-translate-y-1"
+          >
+            帶著榮耀返回圖書館
+          </button>
+          <p className="text-[#B2BEC3] font-bold text-sm tracking-widest uppercase">
+            你已經獲得了專屬於這場探險的勳章
+          </p>
+        </div>
       </motion.div>
     );
   }
@@ -356,14 +470,34 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
           </div>
         </div>
         
-        {/* Progress Bookmark */}
-        <div className="flex gap-2 h-10 items-center bg-white px-4 rounded-full shadow-sm">
+        <div className="flex items-center gap-6">
+          {/* Speed Control Button */}
+          <div className="flex bg-white rounded-full shadow-sm p-1 gap-1">
+            {[0.7, 1.0, 1.3].map(speed => (
+              <button
+                key={speed}
+                onClick={() => setPlaybackSpeed(speed)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-black transition-all ${
+                  playbackSpeed === speed 
+                  ? 'bg-secondary text-white shadow-md' 
+                  : 'text-[#B2BEC3] hover:bg-gray-50'
+                }`}
+              >
+                <Gauge className="w-3 h-3" />
+                <span>{speed === 1.0 ? '正常' : speed + 'x'}</span>
+              </button>
+            ))}
+          </div>
+
+          {/* Progress Bookmark */}
+          <div className="flex gap-2 h-10 items-center bg-white px-4 rounded-full shadow-sm">
            {story.challenges.map((_, i) => (
              <div 
                key={i}
                className={`w-3 h-3 rounded-full transition-all duration-500 ${i <= currentIdx ? 'bg-secondary' : 'bg-gray-100'}`}
              />
            ))}
+          </div>
         </div>
       </div>
 
@@ -384,10 +518,24 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
             <div className="space-y-6">
               <div 
                 className="group cursor-pointer hover:bg-primary/5 p-4 rounded-3xl transition-all relative border border-transparent hover:border-primary/10"
-                onClick={() => speak(challenge.storySegment, challenge.simplifiedStorySegment, 0.8, 1.5)}
+                onClick={() => speak(challenge.storySegment)}
               >
-                <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity bg-primary/20 p-2 rounded-full">
-                  <Volume2 className="w-4 h-4 text-primary" />
+                <div className="absolute top-2 right-2 flex gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                  {isPlaying === challenge.storySegment && (
+                    <div className="flex gap-0.5 items-end h-4 mr-2">
+                      {[1, 2, 3].map(i => (
+                        <motion.div
+                          key={i}
+                          animate={{ height: [4, 12, 4] }}
+                          transition={{ repeat: Infinity, duration: 0.5, delay: i * 0.1 }}
+                          className="w-1 bg-primary rounded-full"
+                        />
+                      ))}
+                    </div>
+                  )}
+                  <div className="bg-primary/20 p-2 rounded-full">
+                    <Volume2 className="w-4 h-4 text-primary" />
+                  </div>
                 </div>
                 <p className="text-3xl lg:text-4xl leading-[1.8] font-medium text-ink/80 font-serif first-letter:text-6xl first-letter:font-black first-letter:text-primary first-letter:mr-3 first-letter:float-left">
                   {challenge.storySegment}
@@ -417,25 +565,36 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
             </div>
 
             {/* Visual Motifs (The Scene Box) */}
-            <div className="mt-12 p-8 bg-white/50 rounded-[32px] border-2 border-dashed border-primary/20 flex justify-center items-center gap-8 shadow-inner min-h-[160px]">
-               {Array.from(challenge.visualMotif || '').map((emoji, i) => (
-                  <motion.div
-                    key={i}
-                    initial={{ scale: 0, y: 20 }}
-                    animate={{ scale: 1, y: 0 }}
-                    transition={{ 
-                      delay: 0.5 + i * 0.1, 
-                      type: 'spring',
-                      stiffness: 260,
-                      damping: 20 
-                    }}
-                    className="text-6xl hover:scale-125 transition-transform cursor-default select-none filter drop-shadow-lg"
-                  >
-                    {emoji}
-                  </motion.div>
-               ))}
+            <div className="mt-12 p-8 bg-white/50 rounded-[32px] border-2 border-dashed border-primary/20 flex flex-wrap justify-center items-center gap-4 lg:gap-8 shadow-inner min-h-[160px]">
+               {Array.from(challenge.visualMotif || '')
+                 .filter(char => {
+                   // More aggressive emoji filter
+                   const code = char.codePointAt(0) || 0;
+                   // Common emoji ranges/characters
+                   return (code >= 0x1F300 && code <= 0x1F9FF) || // Misc Symbols/Pictograms
+                          (code >= 0x2600 && code <= 0x26FF) ||   // Misc Symbols
+                          (code >= 0x2700 && code <= 0x27BF) ||   // Dingbats
+                          (code >= 0x1F000 && code <= 0x1F0FF);   // Other planes
+                 })
+                 .map((char, i) => (
+                    <motion.div
+                      key={i}
+                      initial={{ scale: 0, y: 20 }}
+                      animate={{ scale: 1, y: 0 }}
+                      transition={{ 
+                        delay: 0.5 + i * 0.05, 
+                        type: 'spring',
+                        stiffness: 260,
+                        damping: 20 
+                      }}
+                      className="text-6xl hover:scale-110 transition-transform cursor-default select-none filter drop-shadow-sm"
+                    >
+                      {char}
+                    </motion.div>
+                 ))
+               }
                {(!challenge.visualMotif || challenge.visualMotif.length === 0) && (
-                 <div className="text-primary/20 italic font-medium">魔法場景加載中...</div>
+                 <div className="text-primary/20 italic font-medium">場景加載中...</div>
                )}
             </div>
           </div>
@@ -444,7 +603,7 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
             <div className="w-10 h-10 bg-secondary/10 rounded-full flex items-center justify-center">
               <ChevronRight className="w-5 h-5" />
             </div>
-            <span>向右翻頁開啟魔法挑戰</span>
+            <span>向右翻頁開啟探險挑戰</span>
           </div>
         </motion.div>
 
@@ -461,13 +620,13 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
                <span className="text-5xl group-hover:scale-125 transition-transform duration-500">🧚‍♂️</span>
                <div className="absolute inset-0 bg-gradient-to-t from-secondary/20 to-transparent" />
             </div>
-            <div className="absolute -right-20 top-2 bg-ink text-white p-3 rounded-2xl rounded-bl-none text-sm font-bold animate-pulse whitespace-nowrap">
-              跟我一起唸！✨
+            <div className="absolute -right-28 -top-4 bg-ink text-white p-3 rounded-2xl rounded-bl-none text-sm font-bold animate-pulse whitespace-nowrap shadow-lg">
+              試試看唸出這個詞！✨
             </div>
           </div>
 
           <div className="space-y-6 mb-12">
-            <div className="text-sm font-black text-[#B2BEC3] tracking-[0.2em] mb-4">魔法咒語</div>
+            <div className="text-sm font-black text-[#B2BEC3] tracking-[0.2em] mb-4">目標詞彙</div>
             
             <div className="relative flex justify-center">
               <AnimatePresence>
@@ -482,7 +641,7 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
                       <div className="bg-primary/10 p-1.5 rounded-lg">
                         <Star className="w-3 h-3 text-primary" />
                       </div>
-                      <span className="text-xs font-black text-primary uppercase tracking-widest">魔法筆記</span>
+                      <span className="text-xs font-black text-primary uppercase tracking-widest">發音筆記</span>
                     </div>
                     
                     <div className="space-y-3">
@@ -501,7 +660,7 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
               </AnimatePresence>
 
               <h3 
-                className="text-7xl lg:text-8xl font-black text-primary cursor-pointer hover:scale-105 transition-transform active:scale-95 relative"
+                className="text-7xl lg:text-8xl font-black text-primary cursor-pointer hover:scale-105 transition-transform active:scale-90 relative"
                 onMouseEnter={() => setIsHoveringWord(true)}
                 onMouseLeave={() => setIsHoveringWord(false)}
                 onClick={playReference}
@@ -558,11 +717,11 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -10 }}
-                  onClick={() => speak(feedback.message, '', 0.9, 1.4)}
                   className={`p-6 rounded-[24px] text-sm font-bold leading-relaxed shadow-sm cursor-pointer group hover:scale-[1.02] transition-all relative ${
                     feedback.type === 'success' ? 'bg-green-50 text-green-700 border border-green-200' : 
                     feedback.type === 'error' ? 'bg-red-50 text-red-700 border border-red-200' : 'bg-secondary/5 text-secondary'
                   }`}
+                  onClick={() => speak(feedback.message, feedback.simplifiedMessage)}
                 >
                   <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
                     <Volume2 className="w-4 h-4" />
@@ -573,7 +732,7 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
                   </div>
                   <p>{feedback.message}</p>
                   <div className="mt-2 text-[10px] opacity-70 group-hover:opacity-100 uppercase tracking-widest">
-                    點擊星寶來聽他怎麼說 🔊
+                    點擊聽聽評語 🔊
                   </div>
                 </motion.div>
               )}
@@ -606,7 +765,7 @@ export default function AdventureGame({ story, onExit, onAddMistake, onCompleteS
       </div>
 
       <div className="mt-12 text-center text-[#B2BEC3] font-bold text-sm bg-white/40 inline-block px-8 py-3 rounded-full mx-auto block">
-         「發音魔鏡：小精靈會感應你的每一絲氣息」
+         「發音糾正：星寶會感應你的每一絲氣息」
       </div>
     </div>
   );
