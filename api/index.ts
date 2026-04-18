@@ -1,6 +1,11 @@
-import { createApp } from '../server';
+import { createApp } from '../server.js';
+
+let appPromise = null;
 
 export default async (req, res) => {
-  const app = await createApp();
+  if (!appPromise) {
+    appPromise = createApp();
+  }
+  const app = await appPromise;
   return app(req, res);
 };
