@@ -18,7 +18,12 @@ export async function createApp() {
   const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY || "sk-cp-AGjqRWFpE-k6tHhiHOe7dU3CdEZBpUq5wfzDy3V4qh6ZwQYyGDPnSZVgPvwWfWEyLwPXut3k2VKSsBsDNiVjUrCMR676QidQ6mSsItqPBdOpdv7fbr5HZ1Q";
   const MINIMAX_GROUP_ID = process.env.MINIMAX_GROUP_ID || "1848913859063071415";
   const SILICONFLOW_API_KEY = process.env.SILICONFLOW_API_KEY || "sk-vnvkabupeyrupdgjszmhkwuleqbxvvlvqiyljreyicexqjji";
-  const SILICONFLOW_URL = "https://api.siliconflow.cn/v1/audio/speech";
+  const SILICONFLOW_URL = "https://api.siliconflow.com/v1/audio/speech";
+
+  // Health check
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok", env: process.env.NODE_ENV, vercel: !!process.env.VERCEL });
+  });
 
   // API route for TTS
   app.post("/api/tts", async (req: express.Request, res: express.Response) => {
@@ -85,8 +90,17 @@ export async function createApp() {
 
       res.status(502).json({ error: "All TTS providers failed" });
     } catch (error) {
-      console.error("[Server TTS] General error:", error);
-      res.status(500).json({ error: "Internal server error" });
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error("[Server TTS] Critical failure:", msg);
+      
+      // If we already sent headers, we can't send a JSON response
+      if (!res.headersSent) {
+        res.status(500).json({ 
+          error: "TTS Service Error", 
+          details: msg,
+          hint: "Ensure your API keys are valid and accounts have balance." 
+        });
+      }
     }
   });
 
@@ -147,30 +161,35 @@ export async function createApp() {
     }
   }
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production" && !process.env.VERCEL) {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else if (process.env.NODE_ENV === "production") {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+  // Vite middleware for development (Only if NOT on Vercel)
+  if (!process.env.VERCEL) {
+    if (process.env.NODE_ENV !== "production") {
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.join(process.cwd(), "dist");
+      app.use(express.static(distPath));
+      app.get("*", (req, res) => {
+        res.sendFile(path.join(distPath, "index.html"));
+      });
+    }
   }
 
   return app;
 }
 
 // Only start the server if this file is run directly
-if (import.meta.url.endsWith(process.argv[1]?.replace(/\\/g, '/')) || !process.env.VERCEL) {
+const isDirectRun = process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/'));
+if (isDirectRun || (!process.env.VERCEL && process.env.NODE_ENV !== 'test')) {
   createApp().then(app => {
     const port = Number(process.env.PORT) || 3000;
     app.listen(port, "0.0.0.0", () => {
       console.log(`Server running on http://localhost:${port}`);
     });
+  }).catch(err => {
+    console.error("Failed to start server:", err);
   });
 }
