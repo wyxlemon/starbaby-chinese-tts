@@ -1,0 +1,6 @@
+{
+  "name": "SpeechQuest: The Phonetic Frontier",
+  "description": "A gamified speech practice web app that turns tedious pronunciation drills into an exciting treasure hunt adventure.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": []
+}
